@@ -275,7 +275,7 @@ func (f pollingDeviationCheckerFactory) New(
 	}
 
 	f.logBroadcaster.AddDependents(1)
-	fluxAggregator, err := contracts.NewFluxAggregator(initr.Address, f.store.TxManager, f.logBroadcaster)
+	fluxAggregator, err := contracts.NewFluxAggregator(initr.Address, f.store.EthClient, f.logBroadcaster)
 	if err != nil {
 		return nil, err
 	}
@@ -449,13 +449,13 @@ func (p *PollingDeviationChecker) HandleLog(broadcast eth.LogBroadcast, err erro
 		return
 	}
 
-	rawLog := broadcast.Log()
-	if rawLog == nil || reflect.ValueOf(rawLog).IsNil() {
+	log := broadcast.Log()
+	if log == nil || reflect.ValueOf(log).IsNil() {
 		logger.Error("HandleLog: ignoring nil value")
 		return
 	}
 
-	switch log := rawLog.(type) {
+	switch log := log.(type) {
 	case *contracts.LogNewRound:
 		p.backlog.Add(PriorityNewRoundLog, broadcast)
 
@@ -545,9 +545,10 @@ func (p *PollingDeviationChecker) consume() {
 
 func (p *PollingDeviationChecker) processLogs() {
 	for !p.backlog.Empty() {
-		broadcast, ok := p.backlog.Take().(eth.LogBroadcast)
+		maybeBroadcast := p.backlog.Take()
+		broadcast, ok := maybeBroadcast.(eth.LogBroadcast)
 		if !ok {
-			logger.Error("Failed to convert backlog into LogBroadcast")
+			logger.Errorf("Failed to convert backlog into LogBroadcast.  Type is %T", maybeBroadcast)
 		}
 
 		// If the log is a duplicate of one we've seen before, ignore it (this
@@ -766,7 +767,7 @@ func (p *PollingDeviationChecker) sufficientPayment(payment *big.Int) bool {
 
 // DeviationThresholds carries parameters used by the threshold-trigger logic
 type DeviationThresholds struct {
-	Rel float64 // Relative change required, i.e. |new-old|/|new| >= Rel
+	Rel float64 // Relative change required, i.e. |new-old|/|old| >= Rel
 	Abs float64 // Absolute change required, i.e. |new-old| >= Abs
 }
 
@@ -1050,7 +1051,7 @@ func OutsideDeviation(curAnswer, nextAnswer decimal.Decimal, thresholds Deviatio
 		return true
 	}
 
-	// 100*|new-old|/|new|: Deviation (relative to curAnswer) as a percentage
+	// 100*|new-old|/|old|: Deviation (relative to curAnswer) as a percentage
 	percentage := diff.Div(curAnswer.Abs()).Mul(decimal.NewFromInt(100))
 
 	loggerFields = append(loggerFields, "percentage", percentage)

@@ -9,15 +9,12 @@ import (
 	"time"
 
 	"github.com/smartcontractkit/chainlink/core/logger"
-	"github.com/smartcontractkit/chainlink/core/services/eth"
 	strpkg "github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/store/presenters"
 	"github.com/smartcontractkit/chainlink/core/utils"
 
 	ethereum "github.com/ethereum/go-ethereum"
-	gethCommon "github.com/ethereum/go-ethereum/common"
-	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -61,8 +58,8 @@ const (
 // store on reboot.
 type HeadTracker struct {
 	callbacks             []strpkg.HeadTrackable
-	headers               chan gethTypes.Header
-	headSubscription      eth.Subscription
+	headers               chan *models.Head
+	headSubscription      ethereum.Subscription
 	highestSeenHead       *models.Head
 	store                 *strpkg.Store
 	headMutex             sync.RWMutex
@@ -72,13 +69,6 @@ type HeadTracker struct {
 	started               bool
 	listenForNewHeadsWg   sync.WaitGroup
 	subscriptionSucceeded chan struct{}
-}
-
-type RawHead struct {
-	Number     string
-	Hash       string
-	ParentHash string
-	Timestamp  string
 }
 
 // NewHeadTracker instantiates a new HeadTracker using the orm to persist new block numbers.
@@ -252,7 +242,11 @@ func (ht *HeadTracker) receiveHeaders() error {
 			if !open {
 				return errors.New("HeadTracker headers prematurely closed")
 			}
-			if err := ht.handleNewHead(blockHeader); err != nil {
+			if blockHeader == nil {
+				logger.Warn("got nil block header")
+				continue
+			}
+			if err := ht.handleNewHead(*blockHeader); err != nil {
 				return err
 			}
 		case err, open := <-ht.headSubscription.Err():
@@ -263,7 +257,7 @@ func (ht *HeadTracker) receiveHeaders() error {
 	}
 }
 
-func (ht *HeadTracker) handleNewHead(bh gethTypes.Header) error {
+func (ht *HeadTracker) handleNewHead(head models.Head) error {
 	defer func(start time.Time, number int64) {
 		elapsed := time.Since(start)
 		ms := float64(elapsed.Milliseconds())
@@ -274,14 +268,13 @@ func (ht *HeadTracker) handleNewHead(bh gethTypes.Header) error {
 		} else {
 			logger.Debugw(fmt.Sprintf("HeadTracker finished processing head %v in %s", number, elapsed.String()), "blockNumber", number, "time", elapsed, "id", "head_tracker")
 		}
-	}(time.Now(), bh.Number.Int64())
-	head := models.NewHeadFromBlockHeader(bh)
+	}(time.Now(), int64(head.Number))
 	prevHead := ht.HighestSeenHead()
 
-	logger.Debugw(
-		fmt.Sprintf("Received new head %v", presenters.FriendlyBigInt(head.ToInt())),
+	logger.Debugw(fmt.Sprintf("Received new head %v", presenters.FriendlyBigInt(head.ToInt())),
 		"blockHeight", head.ToInt(),
-		"blockHash", bh.Hash())
+		"blockHash", head.Hash,
+	)
 
 	if err := ht.Save(head); err != nil {
 		return err
@@ -409,46 +402,56 @@ func (ht *HeadTracker) backfill(ctx context.Context, head models.Head, baseHeigh
 
 func (ht *HeadTracker) fetchAndSaveHead(ctx context.Context, n int64) (models.Head, error) {
 	logger.Debugw("HeadTracker: fetching head", "blockHeight", n)
-	head, err := ht.fetchHead(ctx, n)
+	head, err := ht.store.EthClient.HeaderByNumber(ctx, big.NewInt(n))
 	if err != nil {
-		return head, err
+		return models.Head{}, err
+	} else if head == nil {
+		return models.Head{}, errors.New("got nil head")
 	}
-	if err := ht.store.IdempotentInsertHead(head); err != nil {
-		return head, err
+	if err := ht.store.IdempotentInsertHead(*head); err != nil {
+		return models.Head{}, err
 	}
-	return head, nil
-}
-
-func (ht *HeadTracker) fetchHead(ctx context.Context, n int64) (head models.Head, err error) {
-	rh := RawHead{}
-	if err = ht.store.GethClientWrapper.RPCClient(func(rpc eth.RPCClient) error {
-		return rpc.CallContext(ctx, &rh, "eth_getBlockByNumber", utils.Uint64ToHex(uint64(n)), false)
-	}); err != nil {
-		return head, errors.Wrap(err, "error calling eth_getBlockByNumber")
-	}
-	if rh.Number == "" {
-		return head, ethereum.NotFound
-	}
-	number, err := utils.HexToUint64(rh.Number)
-	if err != nil {
-		return head, errors.Wrap(err, "could not decode head number")
-	}
-	time, err := utils.HexToUint64(rh.Timestamp)
-	if err != nil {
-		return head, errors.Wrap(err, "could not decode head timestamp")
-	}
-	return models.NewHead(big.NewInt(int64(number)), gethCommon.HexToHash(rh.Hash), gethCommon.HexToHash(rh.ParentHash), time), nil
+	return *head, nil
 }
 
 func (ht *HeadTracker) onNewLongestChain(headWithChain models.Head) {
 	ht.headMutex.Lock()
 	defer ht.headMutex.Unlock()
-	logger.Debugw("HeadTracker initiating callbacks", "headNum", headWithChain.Number, "chainLength", headWithChain.ChainLength())
 
-	for i, trackable := range ht.callbacks {
+	logger.Debugw("HeadTracker initiating callbacks",
+		"headNum", headWithChain.Number,
+		"chainLength", headWithChain.ChainLength(),
+	)
+
+	if ht.store.Config.EnableBulletproofTxManager() {
+		ht.concurrentlyExecuteCallbacks(headWithChain)
+	} else {
+		// NOTE: Legacy tx manager probably has implicit ordering requirements, so it's not safe to parallelise
+		ht.seriallyExecuteCallbacks(headWithChain)
+	}
+}
+
+func (ht *HeadTracker) concurrentlyExecuteCallbacks(headWithChain models.Head) {
+	wg := sync.WaitGroup{}
+	wg.Add(len(ht.callbacks))
+	for idx, trackable := range ht.callbacks {
+		go func(i int, t strpkg.HeadTrackable) {
+			start := time.Now()
+			t.OnNewLongestChain(headWithChain)
+			elapsed := time.Since(start)
+			logger.Debugw(fmt.Sprintf("HeadTracker: finished callback %v in %s", i, elapsed), "callbackType", reflect.TypeOf(t), "callbackIdx", i, "blockNumber", headWithChain.Number, "time", elapsed, "id", "head_tracker")
+			wg.Done()
+		}(idx, trackable)
+	}
+	wg.Wait()
+}
+
+func (ht *HeadTracker) seriallyExecuteCallbacks(headWithChain models.Head) {
+	for i, t := range ht.callbacks {
 		start := time.Now()
-		trackable.OnNewLongestChain(headWithChain)
-		logger.Debugw(fmt.Sprintf("HeadTracker: finished callback %v", i), "callbackType", reflect.TypeOf(trackable), "callbackIdx", i, "blockNumber", headWithChain.Number, "time", time.Since(start), "id", "head_tracker")
+		t.OnNewLongestChain(headWithChain)
+		elapsed := time.Since(start)
+		logger.Debugw(fmt.Sprintf("HeadTracker: finished callback %v in %s", i, elapsed), "callbackType", reflect.TypeOf(t), "callbackIdx", i, "blockNumber", headWithChain.Number, "time", elapsed, "id", "head_tracker")
 	}
 }
 
@@ -456,11 +459,10 @@ func (ht *HeadTracker) subscribeToHead() error {
 	ht.headMutex.Lock()
 	defer ht.headMutex.Unlock()
 
-	ctx := context.Background()
-	ht.headers = make(chan gethTypes.Header, headsBufferSize)
-	sub, err := ht.store.TxManager.SubscribeToNewHeads(ctx, ht.headers)
+	ht.headers = make(chan *models.Head, headsBufferSize)
+	sub, err := ht.store.EthClient.SubscribeNewHead(context.Background(), ht.headers)
 	if err != nil {
-		return errors.Wrap(err, "TxManager#SubscribeToNewHeads")
+		return errors.Wrap(err, "EthClient#SubscribeNewHead")
 	}
 
 	if err := verifyEthereumChainID(ht); err != nil {
@@ -502,7 +504,7 @@ func (ht *HeadTracker) setHighestSeenHeadFromDB() error {
 // chainIDVerify checks whether or not the ChainID from the Chainlink config
 // matches the ChainID reported by the ETH node connected to this Chainlink node.
 func verifyEthereumChainID(ht *HeadTracker) error {
-	ethereumChainID, err := ht.store.TxManager.GetChainID()
+	ethereumChainID, err := ht.store.EthClient.ChainID(context.TODO())
 	if err != nil {
 		return err
 	}
